@@ -96,6 +96,10 @@ def index():
             if scrape_broken:
                 # 分页不完整，任何配对结论都不可信，仅保留错误提示
                 determination = None
+            elif determination.ambiguous:
+                # 同号记录无法唯一配对：整次查询不得给出确定末班
+                errors.extend(determination.problems)
+                determination = None
             elif determination.latest is None:
                 # 没有任何可信班次，所有问题升级为阻断性错误
                 errors.extend(determination.problems)

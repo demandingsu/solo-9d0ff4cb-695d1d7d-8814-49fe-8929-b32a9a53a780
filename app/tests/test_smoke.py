@@ -98,6 +98,46 @@ class SmokeTests(unittest.TestCase):
         html = client.post("/", data={}).get_data(as_text=True)
         self.assertIn("请填写", html)
 
+    def test_same_trip_no_weekend_across_pages(self):
+        # N207 同号含工作日/周末两条，中央厂区页周末行排在工作日行之前；
+        # 周六晚查询只能核定到周末记录（23:35 发 / 24:55 到，即周日 00:55），
+        # 不能错报成先读到的工作日时刻。
+        html = self._post(
+            earliest_depart="2026-11-14T22:00",
+            latest_arrive="2026-11-15T02:00",
+        ).get_data(as_text=True)
+        self.assertNotIn("⚠ 无法核定末班", html)
+        self.assertIn("N207", html)
+        self.assertIn("2026-11-14 23:35", html)
+        self.assertIn("2026-11-15 00:55", html)
+        # 工作日记录 23:05 / 24:15 不得混入周末查询结果
+        self.assertNotIn("2026-11-14 23:05", html)
+
+    def test_same_trip_no_weekday_ignores_page_order(self):
+        # 周三晚：N207 必须按服务日类型配到工作日记录，
+        # 即便中央厂区分页里周末行排在前面。
+        html = self._post(
+            earliest_depart="2026-11-11T22:00",
+            latest_arrive="2026-11-12T02:00",
+        ).get_data(as_text=True)
+        self.assertIn("N207", html)
+        self.assertIn("2026-11-11 23:05", html)
+        self.assertIn("2026-11-12 00:15", html)
+        self.assertNotIn("23:35", html)
+
+    def test_ambiguous_trip_blocks_entire_query(self):
+        # N208 在滨河园区、夜班宿舍各有两条同号周末停站行，无法唯一配对，
+        # 整次查询只能显示无法核定并指出 N208，不得给出确定末班。
+        html = self._post(
+            alight_station="夜班宿舍",
+            earliest_depart="2026-11-14T22:00",
+            latest_arrive="2026-11-15T04:00",
+        ).get_data(as_text=True)
+        self.assertIn("无法核定末班", html)
+        self.assertIn("N208", html)
+        self.assertIn("无法唯一配对", html)
+        self.assertNotIn("最晚可乘坐", html)
+
 
 if __name__ == "__main__":
     unittest.main()

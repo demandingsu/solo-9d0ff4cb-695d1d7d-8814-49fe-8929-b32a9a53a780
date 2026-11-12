@@ -89,6 +89,8 @@ class Determination:
     latest: TripOption | None = None
     options: list[TripOption] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    # 同一服务日内同号记录无法唯一配对的车次号；非空时整次查询不得给出确定末班
+    ambiguous: list[str] = field(default_factory=list)
 
 
 def _station_key(name: str) -> str:
@@ -105,35 +107,75 @@ def determine_last_trip(
 ) -> Determination:
     """按车次号与停站顺序配对两站记录，核定可乘坐的最晚一班。
 
-    筛选条件：
-      1. 两站记录车次号相同，且上车站停站顺序早于下车站；
-      2. 两站均有可解析的关键时刻，服务日类型一致；
+    两站时刻表都可能跨多个分页，同一车次号在同一站内会出现多条记录
+    （工作日 / 周末各一条，且两站分页的行顺序可能不同）。本函数保留
+    同号全部停站记录，按 **车次号 + 始发服务日类型** 分组配对，结论
+    不依赖任何分页行顺序：
+
+      1. 同一服务日组内，上车站记录与下车站记录都必须恰好只有一条，
+         且上车站停站顺序早于下车站，才算唯一配对；任一侧出现多条
+         同号同服务日记录即视为有歧义，该服务日组不予核定；
+      2. 两站均有可解析的关键时刻，两站服务日类型按分组天然一致；
       3. 在“最早出门 ~ 到岗截止”覆盖的始发服务日内，该班次当天运行；
       4. 实际发车不早于最早出门、实际到站不晚于到岗截止。
+
+    只要任一车次在任一服务日组无法唯一配对（``ambiguous`` 非空），
+    整次查询返回 ``latest=None``，由调用方展示“无法核定”并指出有
+    歧义的车次，不得给出确定末班。
 
     24:xx 跨日时刻按 ``始发服务日零点 + 时间差`` 换算成真实日期时间。
     """
     result = Determination()
     board_key, alight_key = _station_key(board_station), _station_key(alight_station)
 
-    board_map: dict[str, StopRecord] = {}
-    alight_map: dict[str, StopRecord] = {}
-    for rec in board_records:
-        if _station_key(rec.station) == board_key:
-            board_map.setdefault(rec.trip_no, rec)
-    for rec in alight_records:
-        if _station_key(rec.station) == alight_key:
-            alight_map.setdefault(rec.trip_no, rec)
+    # 保留同号全部停站记录，按 (车次号, 服务日类型) 分组。
+    # 分页重复抓取产生的完全相同行先去重，避免把重复行误判成歧义。
+    board_groups: dict[tuple[str, str], list[StopRecord]] = {}
+    alight_groups: dict[tuple[str, str], list[StopRecord]] = {}
+    board_seen: set[tuple] = set()
+    alight_seen: set[tuple] = set()
 
-    if not board_map:
+    def _dedup_key(rec: StopRecord) -> tuple:
+        return (
+            rec.trip_no,
+            rec.stop_seq,
+            _station_key(rec.station),
+            (rec.clock or "").strip(),
+            rec.service_kind,
+        )
+
+    for rec in board_records:
+        if _station_key(rec.station) != board_key:
+            continue
+        key = _dedup_key(rec)
+        if key in board_seen:
+            continue
+        board_seen.add(key)
+        board_groups.setdefault((rec.trip_no, rec.service_kind), []).append(rec)
+    for rec in alight_records:
+        if _station_key(rec.station) != alight_key:
+            continue
+        key = _dedup_key(rec)
+        if key in alight_seen:
+            continue
+        alight_seen.add(key)
+        alight_groups.setdefault((rec.trip_no, rec.service_kind), []).append(rec)
+
+    board_trips = {trip_no for trip_no, _ in board_groups}
+    alight_trips = {trip_no for trip_no, _ in alight_groups}
+    if not board_trips:
         result.problems.append(f"上车站「{board_station}」没有解析到任何车次记录。")
-    if not alight_map:
+    if not alight_trips:
         result.problems.append(f"下车站「{alight_station}」没有解析到任何车次记录。")
 
-    # 上车站能看到、下车站却没有记录的车次，无法确认能否到岗，需提示数据不全
-    for trip_no in sorted(set(board_map) - set(alight_map)):
+    # 只在某一侧出现的车次，无法确认能否到岗，需提示数据不全
+    for trip_no in sorted(board_trips - alight_trips):
         result.problems.append(
             f"车次 {trip_no} 在「{alight_station}」站时刻表中没有记录，无法核定该班次。"
+        )
+    for trip_no in sorted(alight_trips - board_trips):
+        result.problems.append(
+            f"车次 {trip_no} 在「{board_station}」站时刻表中没有记录，无法核定该班次。"
         )
 
     # 从最早出门当天到截止当天都可能是始发服务日（跨日车次的零点在该区间内）
@@ -144,20 +186,37 @@ def determine_last_trip(
         for i in range((last_day - first_day).days + 1)
     ]
 
-    for trip_no in sorted(set(board_map) & set(alight_map)):
-        b_rec, a_rec = board_map[trip_no], alight_map[trip_no]
+    # 通过结构校验的配对规格，歧义判定全部结束后再展开成班次选项
+    pair_specs: list[tuple[str, str, StopRecord, StopRecord]] = []
+
+    # 分组键排序保证配对过程与输入（分页）顺序完全无关，结论可复现
+    for group_key in sorted(set(board_groups) & set(alight_groups)):
+        trip_no, service_kind = group_key
+        label = SERVICE_LABELS.get(service_kind, service_kind)
+        b_recs = board_groups[group_key]
+        a_recs = alight_groups[group_key]
+
+        # 同一服务日同号记录必须两侧都唯一，否则无法确定哪两条属于同一行程
+        if len(b_recs) > 1 or len(a_recs) > 1:
+            result.ambiguous.append(trip_no)
+            result.problems.append(
+                f"车次 {trip_no} 的{label}服务日记录在两站分页中存在 "
+                f"{len(b_recs)} 条「{board_station}」、{len(a_recs)} 条"
+                f"「{alight_station}」停站记录，无法唯一配对，该{label}班次不予核定。"
+            )
+            continue
+
+        b_rec, a_rec = b_recs[0], a_recs[0]
 
         if b_rec.stop_seq is None or a_rec.stop_seq is None:
-            result.problems.append(f"车次 {trip_no} 缺少停站顺序，无法确认上下车先后。")
+            result.problems.append(
+                f"车次 {trip_no}（{label}）缺少停站顺序，无法确认上下车先后。"
+            )
             continue
         if b_rec.stop_seq >= a_rec.stop_seq:
             result.problems.append(
-                f"车次 {trip_no} 的停站顺序不满足「{board_station}」先于「{alight_station}」。"
-            )
-            continue
-        if b_rec.service_kind != a_rec.service_kind:
-            result.problems.append(
-                f"车次 {trip_no} 在两站页面标注的服务日类型不一致，已跳过。"
+                f"车次 {trip_no}（{label}）的停站顺序不满足"
+                f"「{board_station}」先于「{alight_station}」。"
             )
             continue
 
@@ -168,7 +227,9 @@ def determine_last_trip(
         if a_delta is None:
             missing.append(f"「{alight_station}」到站时刻")
         if missing:
-            result.problems.append(f"车次 {trip_no} 缺少关键时刻（{'、'.join(missing)}），无法核定。")
+            result.problems.append(
+                f"车次 {trip_no}（{label}）缺少关键时刻（{'、'.join(missing)}），无法核定。"
+            )
             continue
 
         # 停站顺序在下、时刻却更早（如 23:50 发车、01:00 到站且未用 25:00 书写），
@@ -177,11 +238,29 @@ def determine_last_trip(
             a_delta += timedelta(hours=24)
         if a_delta < b_delta:
             result.problems.append(
-                f"车次 {trip_no} 两站时刻矛盾（到站早于发车且无法按跨日解释），无法核定。"
+                f"车次 {trip_no}（{label}）两站时刻矛盾"
+                f"（到站早于发车且无法按跨日解释），无法核定。"
             )
             continue
 
-        service_kind = b_rec.service_kind
+        pair_specs.append((trip_no, service_kind, b_rec, a_rec))
+
+    # 存在任何无法唯一配对的同号记录：整次查询不给出确定末班
+    if result.ambiguous:
+        result.ambiguous = sorted(set(result.ambiguous))
+        result.problems.append(
+            "车次 " + "、".join(result.ambiguous)
+            + " 的同号停站记录无法唯一配对，本次查询无法核定末班，"
+            "请勿采信任何确定末班结论。"
+        )
+        result.options = []
+        result.latest = None
+        return result
+
+    for trip_no, service_kind, b_rec, a_rec in pair_specs:
+        b_delta, a_delta = b_rec.clock_delta(), a_rec.clock_delta()
+        if a_delta < b_delta:
+            a_delta += timedelta(hours=24)
         for service_day in candidate_days:
             if not service_runs_on(service_kind, service_day):
                 continue

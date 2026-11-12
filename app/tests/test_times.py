@@ -160,5 +160,166 @@ class DetermineTests(unittest.TestCase):
         self.assertTrue(any("W9" in p and "没有记录" in p for p in d.problems))
 
 
+class SameTripNoPaginationTests(unittest.TestCase):
+    """同车次号跨分页（工作日/周末各一条、两站行序相反）的配对测试。"""
+
+    BOARD = "滨河园区"
+    ALIGHT = "中央厂区"
+    WED_EARLY = datetime(2026, 11, 11, 22, 0)   # 周三晚
+    WED_DEAD = datetime(2026, 11, 12, 2, 0)
+    SAT_EARLY = datetime(2026, 11, 14, 22, 0)   # 周六晚
+    SAT_DEAD = datetime(2026, 11, 15, 2, 0)
+
+    def _records(self, board_reversed=False, alight_reversed=False):
+        board = [
+            rec("N207", 1, self.BOARD, "23:05", WEEKDAY),
+            rec("N207", 1, self.BOARD, "23:35", WEEKEND),
+        ]
+        # 下车站分页行顺序与上车站相反：周末在前、工作日在后
+        alight = [
+            rec("N207", 3, self.ALIGHT, "24:55", WEEKEND),
+            rec("N207", 3, self.ALIGHT, "24:15", WEEKDAY),
+        ]
+        if board_reversed:
+            board.reverse()
+        if alight_reversed:
+            alight.reverse()
+        return board, alight
+
+    def test_weekday_picks_weekday_record_not_first_row(self):
+        board, alight = self._records(board_reversed=True)
+        d = determine_last_trip(
+            board, alight, self.BOARD, self.ALIGHT,
+            self.WED_EARLY, self.WED_DEAD,
+        )
+        self.assertEqual(d.ambiguous, [])
+        self.assertEqual(len(d.options), 1)
+        self.assertEqual(d.latest.trip_no, "N207")
+        self.assertEqual(d.latest.service_kind, WEEKDAY)
+        # 不能因为周末行在分页里先读到就错报：工作日组必须配到 23:05 / 24:15
+        self.assertEqual(d.latest.depart_clock, "23:05")
+        self.assertEqual(d.latest.arrive_clock, "24:15")
+        self.assertEqual(d.latest.depart_dt, datetime(2026, 11, 11, 23, 5))
+        self.assertEqual(d.latest.arrive_dt, datetime(2026, 11, 12, 0, 15))
+
+    def test_weekend_picks_weekend_record(self):
+        board, alight = self._records()
+        d = determine_last_trip(
+            board, alight, self.BOARD, self.ALIGHT,
+            self.SAT_EARLY, self.SAT_DEAD,
+        )
+        self.assertEqual(len(d.options), 1)
+        self.assertEqual(d.latest.service_kind, WEEKEND)
+        self.assertEqual(d.latest.depart_clock, "23:35")
+        self.assertEqual(d.latest.arrive_clock, "24:55")
+        self.assertEqual(d.latest.depart_dt, datetime(2026, 11, 14, 23, 35))
+        self.assertEqual(d.latest.arrive_dt, datetime(2026, 11, 15, 0, 55))
+
+    def test_result_independent_of_row_order(self):
+        def summary(d):
+            return (
+                tuple(
+                    sorted(
+                        (o.trip_no, o.service_kind, o.depart_dt.isoformat(),
+                         o.arrive_dt.isoformat())
+                        for o in d.options
+                    )
+                ),
+                d.latest is None,
+                tuple(sorted(d.ambiguous)),
+            )
+
+        results = []
+        for b_rev in (False, True):
+            for a_rev in (False, True):
+                board, alight = self._records(b_rev, a_rev)
+                d = determine_last_trip(
+                    board, alight, self.BOARD, self.ALIGHT,
+                    self.SAT_EARLY, self.SAT_DEAD,
+                )
+                results.append(summary(d))
+        self.assertEqual(len(set(results)), 1)
+
+    def test_identical_duplicate_rows_are_deduped(self):
+        # 同一条记录在相邻分页被重复抓取，不应被当成歧义
+        board = [
+            rec("W1", 1, self.BOARD, "23:00", DAILY),
+            rec("W1", 1, self.BOARD, "23:00", DAILY),
+        ]
+        alight = [
+            rec("W1", 3, self.ALIGHT, "23:40", DAILY),
+            rec("W1", 3, self.ALIGHT, "23:40", DAILY),
+        ]
+        d = determine_last_trip(
+            board, alight, self.BOARD, self.ALIGHT,
+            self.WED_EARLY, self.WED_DEAD,
+        )
+        self.assertEqual(d.ambiguous, [])
+        self.assertIsNotNone(d.latest)
+        self.assertEqual(d.latest.trip_no, "W1")
+        self.assertEqual(len(d.options), 1)
+
+
+class AmbiguousPairTests(unittest.TestCase):
+    """同一服务日同号记录无法唯一配对时，整次查询不得给出确定末班。"""
+
+    BOARD = "滨河园区"
+    ALIGHT = "夜班宿舍"
+    SAT_EARLY = datetime(2026, 11, 14, 22, 0)
+    SAT_DEAD = datetime(2026, 11, 15, 4, 0)
+
+    def test_duplicates_both_sides_block_entire_query(self):
+        board = [
+            rec("N208", 1, self.BOARD, "23:55", WEEKEND),
+            rec("N208", 1, self.BOARD, "24:35", WEEKEND),
+        ]
+        alight = [
+            rec("N208", 4, self.ALIGHT, "26:25", WEEKEND),
+            rec("N208", 4, self.ALIGHT, "27:05", WEEKEND),
+        ]
+        d = determine_last_trip(
+            board, alight, self.BOARD, self.ALIGHT,
+            self.SAT_EARLY, self.SAT_DEAD,
+        )
+        self.assertIsNone(d.latest)
+        self.assertEqual(d.options, [])
+        self.assertEqual(d.ambiguous, ["N208"])
+        self.assertTrue(any("N208" in p and "无法唯一配对" in p for p in d.problems))
+        self.assertTrue(any("无法核定末班" in p for p in d.problems))
+
+    def test_duplicate_one_side_only_is_ambiguous_too(self):
+        board = [
+            rec("N208", 1, self.BOARD, "23:55", WEEKEND),
+            rec("N208", 1, self.BOARD, "24:35", WEEKEND),
+        ]
+        alight = [rec("N208", 4, self.ALIGHT, "26:25", WEEKEND)]
+        d = determine_last_trip(
+            board, alight, self.BOARD, self.ALIGHT,
+            self.SAT_EARLY, self.SAT_DEAD,
+        )
+        self.assertIsNone(d.latest)
+        self.assertEqual(d.ambiguous, ["N208"])
+
+    def test_ambiguity_blocks_even_when_other_trips_valid(self):
+        # 即使存在其他完整可核定的车次，歧义仍使整次查询不能给确定末班
+        board = [
+            rec("N201", 1, self.BOARD, "22:30", WEEKDAY),
+            rec("N208", 1, self.BOARD, "23:55", WEEKEND),
+            rec("N208", 1, self.BOARD, "24:35", WEEKEND),
+        ]
+        alight = [
+            rec("N201", 4, self.ALIGHT, "24:10", WEEKDAY),
+            rec("N208", 4, self.ALIGHT, "26:25", WEEKEND),
+            rec("N208", 4, self.ALIGHT, "27:05", WEEKEND),
+        ]
+        d = determine_last_trip(
+            board, alight, self.BOARD, self.ALIGHT,
+            self.SAT_EARLY, self.SAT_DEAD,
+        )
+        self.assertIsNone(d.latest)
+        self.assertEqual(d.options, [])
+        self.assertIn("N208", d.ambiguous)
+
+
 if __name__ == "__main__":
     unittest.main()
